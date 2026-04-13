@@ -166,10 +166,11 @@ get_fan1_rpm() {
 # ── Fan 2 control (ONLY register 0xF922, bit 0x40) ──────────────────────
 
 fan2_present() {
+    # Test if fan 2 actually responds via ST83 (more reliable than RRAM 0xF920 flag,
+    # which returns 0x89 on UX510UWK — bit 0x02 not set despite fan 2 working)
     local val
-    val=$(acpi_call '\_SB.PCI0.LPCB.EC0.RRAM 0xF920' | sed 's/^0x//')
-    val=$((16#${val}))
-    [ $(( val & 0x02 )) -ne 0 ]
+    val=$(acpi_call '\_SB.PCI0.LPCB.EC0.ST83 1')
+    [ -n "$val" ] && [ "$val" != "Error" ]
 }
 
 fan2_read_reg() {
@@ -212,7 +213,7 @@ preflight_checks() {
 
     # 2. Fan 2 physically present?
     if ! fan2_present; then
-        log_err "Fan 2 not detected (RRAM 0xF920 bit 0x02 not set)"
+        log_err "Fan 2 not detected (ST83 1 returned no valid response)"
         exit 1
     fi
     log "Fan 2 presence confirmed"
