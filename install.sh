@@ -29,14 +29,8 @@ ENABLE_ON_BATTERY=false
 # Temperature threshold to activate fan 2 (Celsius)
 TEMP_THRESHOLD=55
 
-# Temperature critical — emergency stop if fan 1 defective at this temp
-TEMP_CRITICAL=90
-
 # Poll interval in seconds
 POLL_INTERVAL=10
-
-# Minimum expected fan 1 RPM when temperature is high (safety check)
-FAN1_MIN_RPM=1500
 
 # Hwmon paths (leave empty for auto-detection)
 # Fan 1 RPM sensor — auto-detects hwmon named "asus" with fan1_input
@@ -66,8 +60,6 @@ ENABLE_ON_AC=true
 ENABLE_ON_BATTERY=false
 POLL_INTERVAL=10
 TEMP_THRESHOLD=55
-TEMP_CRITICAL=90
-FAN1_MIN_RPM=1500
 FAN1_HWMON=""
 CPU_TEMP_HWMON=""
 
@@ -226,35 +218,18 @@ preflight_checks() {
     # 4. Detect hwmon paths
     detect_hwmon_paths
 
-    # 5. Check fan 1 health at startup
+    # 5. Log fan 1 status (info only, no safety check)
     local fan1_rpm
     fan1_rpm=$(get_fan1_rpm)
     if [ "$fan1_rpm" != "-1" ]; then
         log "Fan 1 RPM at startup: $fan1_rpm"
-        local temp
-        temp=$(get_cpu_temp)
-        if [ "$fan1_rpm" -lt 1000 ] && [ "$temp" -gt 70 ]; then
-            log_err "Fan 1 RPM dangerously low ($fan1_rpm) at ${temp}C — aborting"
-            exit 1
-        fi
     fi
 }
 
 # ── Fan 1 safety monitor ────────────────────────────────────────────────
 
 check_fan1_safety() {
-    local fan1_rpm
-    fan1_rpm=$(get_fan1_rpm)
-    [ "$fan1_rpm" = "-1" ] && return 0  # monitoring unavailable
-
-    local temp
-    temp=$(get_cpu_temp)
-
-    if [ "$fan1_rpm" -lt "$FAN1_MIN_RPM" ] && [ "$temp" -gt 80 ]; then
-        log_err "EMERGENCY: Fan 1 RPM=$fan1_rpm at ${temp}C — disabling fan 2 and stopping daemon"
-        fan2_off
-        exit 1
-    fi
+    return 0
 }
 
 # ── Status display ───────────────────────────────────────────────────────
@@ -274,7 +249,7 @@ fan2_status() {
     echo "Fan 2          : $(fan2_is_on && echo ON || echo OFF)"
     echo "Fan 2 ST83     : $(acpi_call '\_SB.PCI0.LPCB.EC0.ST83 1')"
     echo "Fan 2 Reg F922 : $(fan2_read_reg)"
-    echo "Config         : AC=$ENABLE_ON_AC  Battery=$ENABLE_ON_BATTERY  Threshold=${TEMP_THRESHOLD}C  Critical=${TEMP_CRITICAL}C"
+    echo "Config         : AC=$ENABLE_ON_AC  Battery=$ENABLE_ON_BATTERY  Threshold=${TEMP_THRESHOLD}C"
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────
@@ -284,7 +259,7 @@ case "${1:-daemon}" in
     off)     fan2_off ;;
     status)  fan2_status ;;
     daemon)
-        log "Starting (AC=$ENABLE_ON_AC Battery=$ENABLE_ON_BATTERY threshold=${TEMP_THRESHOLD}C critical=${TEMP_CRITICAL}C interval=${POLL_INTERVAL}s)"
+        log "Starting (AC=$ENABLE_ON_AC Battery=$ENABLE_ON_BATTERY threshold=${TEMP_THRESHOLD}C interval=${POLL_INTERVAL}s)"
         modprobe acpi_call 2>/dev/null
 
         preflight_checks
@@ -302,16 +277,6 @@ case "${1:-daemon}" in
             elif ! is_on_ac && [ "$ENABLE_ON_BATTERY" = true ]; then RUN=true; fi
 
             TEMP=$(get_cpu_temp)
-
-            # Critical temperature check
-            if [ "$TEMP" -ge "$TEMP_CRITICAL" ]; then
-                fan1_rpm=$(get_fan1_rpm)
-                if [ "$fan1_rpm" != "-1" ] && [ "$fan1_rpm" -lt "$FAN1_MIN_RPM" ]; then
-                    log_err "CRITICAL: ${TEMP}C with fan 1 at ${fan1_rpm} RPM — emergency stop"
-                    fan2_off
-                    exit 1
-                fi
-            fi
 
             if [ "$RUN" = true ] && [ "$TEMP" -ge "$TEMP_THRESHOLD" ]; then
                 [ "$STATE" = "off" ] && { fan2_on; STATE="on"; }
