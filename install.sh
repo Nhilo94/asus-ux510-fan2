@@ -29,10 +29,6 @@ ENABLE_ON_BATTERY=false
 # CPU temperature threshold to activate fan 2 (Celsius)
 TEMP_THRESHOLD=75
 
-# GPU temperature threshold to activate fan 2 (Celsius)
-# Fan 2 is the GPU fan — it reacts to GPU temp too
-GPU_TEMP_THRESHOLD=65
-
 # Hysteresis: fan 2 turns OFF only when temp drops this many degrees below threshold
 # Prevents oscillation when temperature bounces around the threshold
 TEMP_HYSTERESIS=10
@@ -69,7 +65,6 @@ ENABLE_ON_AC=true
 ENABLE_ON_BATTERY=false
 POLL_INTERVAL=20
 TEMP_THRESHOLD=75
-GPU_TEMP_THRESHOLD=65
 TEMP_HYSTERESIS=10
 TREND_RATE=4
 FAN1_HWMON=""
@@ -255,39 +250,29 @@ fan2_status() {
     fan1_rpm=$(get_fan1_rpm)
     ac=$(is_on_ac && echo "yes" || echo "no")
 
-    echo "=== ASUS UX510 Fan 2 Status ==="
-    echo "AC Power       : $ac"
-    echo "CPU Temp       : ${cpu_t}°C  (threshold: ${TEMP_THRESHOLD}°C, hysteresis: ${TEMP_HYSTERESIS}°C)"
-    [ "$gpu_t" != "-1" ] && echo "GPU Temp       : ${gpu_t}°C  (threshold: ${GPU_TEMP_THRESHOLD}°C)"
-    [ "$fan1_rpm" != "-1" ] && echo "Fan 1 RPM      : $fan1_rpm"
-    echo "Fan 2 state    : $(fan2_is_on && echo "ON" || echo "OFF")"
-    echo "Fan 2 ST83     : $(acpi_call '\_SB.PCI0.LPCB.EC0.ST83 1')"
-    echo "Fan 2 Reg F922 : $(fan2_read_reg)"
-    echo "Config         : AC=$ENABLE_ON_AC  Battery=$ENABLE_ON_BATTERY"
-    echo "                 CPU_thresh=${TEMP_THRESHOLD}°C  GPU_thresh=${GPU_TEMP_THRESHOLD}°C  hysteresis=${TEMP_HYSTERESIS}°C"
+    echo "=== ASUS UX510 Fan 2 (CPU fan) Status ==="
+    echo "AC Power          : $ac"
+    echo "CPU Temp          : ${cpu_t}°C  (ON>=${TEMP_THRESHOLD}°C, OFF<$(( TEMP_THRESHOLD - TEMP_HYSTERESIS ))°C)"
+    [ "$gpu_t" != "-1" ] && echo "GPU Temp          : ${gpu_t}°C  [info only]"
+    [ "$fan1_rpm" != "-1" ] && echo "GPU fan (fan1) RPM: $fan1_rpm  [BIOS-managed]"
+    echo "CPU fan (fan2)    : $(fan2_is_on && echo "ON" || echo "OFF")"
+    echo "Fan 2 ST83        : $(acpi_call '\_SB.PCI0.LPCB.EC0.ST83 1')"
+    echo "Fan 2 Reg F922    : $(fan2_read_reg)"
+    echo "Config            : AC=$ENABLE_ON_AC  Battery=$ENABLE_ON_BATTERY  threshold=${TEMP_THRESHOLD}°C  hyst=${TEMP_HYSTERESIS}°C"
 }
 
 # ── Adaptive poll interval ────────────────────────────────────────────────
 
-# Returns poll delay in seconds based on proximity to threshold
+# Returns poll delay in seconds based on CPU proximity to threshold
 adaptive_poll() {
-    local cpu_t="$1" gpu_t="$2" fan_state="$3"
-    local cpu_dist gpu_dist min_dist
+    local cpu_t="$1" fan_state="$3"
+    local dist
+    dist=$(( TEMP_THRESHOLD - cpu_t ))
+    [ $dist -lt 0 ] && dist=0
 
-    cpu_dist=$(( TEMP_THRESHOLD - cpu_t ))
-    [ $cpu_dist -lt 0 ] && cpu_dist=0
-
-    if [ "$gpu_t" != "-1" ]; then
-        gpu_dist=$(( GPU_TEMP_THRESHOLD - gpu_t ))
-        [ $gpu_dist -lt 0 ] && gpu_dist=0
-        min_dist=$(( cpu_dist < gpu_dist ? cpu_dist : gpu_dist ))
-    else
-        min_dist=$cpu_dist
-    fi
-
-    if [ $min_dist -le 5 ] || [ "$fan_state" = "on" ]; then
+    if [ $dist -le 5 ] || [ "$fan_state" = "on" ]; then
         echo 5      # near threshold or running: check fast
-    elif [ $min_dist -le 15 ]; then
+    elif [ $dist -le 15 ]; then
         echo 10     # warming up
     else
         echo "$POLL_INTERVAL"  # cold: use configured interval
@@ -302,7 +287,7 @@ case "${1:-daemon}" in
     status)  fan2_status ;;
 
     daemon)
-        log "Starting daemon (AC=$ENABLE_ON_AC Battery=$ENABLE_ON_BATTERY cpu_thresh=${TEMP_THRESHOLD}°C gpu_thresh=${GPU_TEMP_THRESHOLD}°C hyst=${TEMP_HYSTERESIS}°C interval=${POLL_INTERVAL}s trend_rate=${TREND_RATE}°C/sample)"
+        log "Starting daemon (AC=$ENABLE_ON_AC Battery=$ENABLE_ON_BATTERY cpu_thresh=${TEMP_THRESHOLD}°C hyst=${TEMP_HYSTERESIS}°C interval=${POLL_INTERVAL}s trend_rate=${TREND_RATE}°C/sample)"
         modprobe acpi_call 2>/dev/null
 
         preflight_checks
@@ -311,7 +296,7 @@ case "${1:-daemon}" in
 
         STATE="off"
         PREV_CPU=0
-        PREV_GPU=-1
+        OFF_THRESH=$(( TEMP_THRESHOLD - TEMP_HYSTERESIS ))
 
         while true; do
             RUN=false
@@ -319,11 +304,6 @@ case "${1:-daemon}" in
             elif ! is_on_ac && [ "$ENABLE_ON_BATTERY" = true ]; then RUN=true; fi
 
             CPU_TEMP=$(get_cpu_temp)
-            GPU_TEMP=$(get_gpu_temp)
-
-            # Hysteresis thresholds
-            OFF_CPU=$(( TEMP_THRESHOLD - TEMP_HYSTERESIS ))
-            OFF_GPU=$(( GPU_TEMP_THRESHOLD - TEMP_HYSTERESIS ))
 
             # Trend detection: rate of rise since last sample
             CPU_TREND=$(( CPU_TEMP - PREV_CPU ))
@@ -331,24 +311,14 @@ case "${1:-daemon}" in
             if [ "$TREND_RATE" -gt 0 ] && [ $CPU_TREND -ge "$TREND_RATE" ]; then
                 TREND_ACTIVE=true
             fi
-            if [ "$GPU_TEMP" != "-1" ] && [ "$PREV_GPU" != "-1" ]; then
-                GPU_TREND=$(( GPU_TEMP - PREV_GPU ))
-                if [ "$TREND_RATE" -gt 0 ] && [ $GPU_TREND -ge "$TREND_RATE" ]; then
-                    TREND_ACTIVE=true
-                fi
-            fi
 
-            # Decision: activate if above threshold, or rising fast, or already on and above hysteresis floor
+            # Decision: activate if above threshold or rising fast; turn off below hysteresis floor
             SHOULD_ON=false
             if [ "$RUN" = true ]; then
                 if [ "$CPU_TEMP" -ge "$TEMP_THRESHOLD" ]; then SHOULD_ON=true; fi
-                if [ "$GPU_TEMP" != "-1" ] && [ "$GPU_TEMP" -ge "$GPU_TEMP_THRESHOLD" ]; then SHOULD_ON=true; fi
                 if [ "$TREND_ACTIVE" = true ]; then SHOULD_ON=true; fi
-                # Keep fan on if still above hysteresis floor (prevent premature off)
-                if [ "$STATE" = "on" ]; then
-                    if [ "$CPU_TEMP" -ge "$OFF_CPU" ]; then SHOULD_ON=true; fi
-                    if [ "$GPU_TEMP" != "-1" ] && [ "$GPU_TEMP" -ge "$OFF_GPU" ]; then SHOULD_ON=true; fi
-                fi
+                # Keep fan on until temp drops below hysteresis floor
+                if [ "$STATE" = "on" ] && [ "$CPU_TEMP" -ge "$OFF_THRESH" ]; then SHOULD_ON=true; fi
             fi
 
             if [ "$SHOULD_ON" = true ] && [ "$STATE" = "off" ]; then
@@ -360,9 +330,8 @@ case "${1:-daemon}" in
             fi
 
             PREV_CPU=$CPU_TEMP
-            PREV_GPU=$GPU_TEMP
 
-            DELAY=$(adaptive_poll "$CPU_TEMP" "$GPU_TEMP" "$STATE")
+            DELAY=$(adaptive_poll "$CPU_TEMP" "" "$STATE")
             sleep "$DELAY"
         done ;;
 
