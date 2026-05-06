@@ -27,7 +27,7 @@ ENABLE_ON_AC=true
 ENABLE_ON_BATTERY=false
 
 # CPU temperature threshold to activate fan 2 (Celsius)
-TEMP_THRESHOLD=75
+TEMP_THRESHOLD=70
 
 # Hysteresis: fan 2 turns OFF only when temp drops this many degrees below threshold
 # Prevents oscillation when temperature bounces around the threshold
@@ -38,7 +38,7 @@ POLL_INTERVAL=20
 
 # Trend activation: if temperature is rising faster than this many °C per sample,
 # activate fan 2 proactively before hitting the threshold (0 = disabled)
-TREND_RATE=4
+TREND_RATE=3
 
 # Hwmon paths (leave empty for auto-detection)
 FAN1_HWMON=""
@@ -66,7 +66,7 @@ ENABLE_ON_BATTERY=false
 POLL_INTERVAL=20
 TEMP_THRESHOLD=75
 TEMP_HYSTERESIS=10
-TREND_RATE=4
+TREND_RATE=3
 FAN1_HWMON=""
 CPU_TEMP_HWMON=""
 
