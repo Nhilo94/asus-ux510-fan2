@@ -32,8 +32,9 @@ These methods were **reverse-engineered from the DSDT ACPI tables** by decompili
 | Metric | Before | After |
 |--------|--------|-------|
 | CPU Fan (fan1) | 5700 RPM | 4500 RPM (less stressed) |
-| GPU Fan (fan2) | **OFF** | **ON** |
+| GPU Fan (fan2) | **OFF** | **ON** (daemon-controlled) |
 | CPU Temperature | **88°C** | **70°C** |
+| GPU Temperature | unmonitored | monitored, triggers fan at 65°C |
 
 ## Compatibility
 
@@ -86,14 +87,36 @@ ENABLE_ON_AC=true
 # Enable fan 2 when on battery (false = save power)
 ENABLE_ON_BATTERY=false
 
-# Temperature threshold to activate fan 2 (Celsius)
-TEMP_THRESHOLD=55
+# CPU temperature threshold to activate fan 2 (Celsius)
+TEMP_THRESHOLD=75
 
-# Poll interval in seconds
-POLL_INTERVAL=10
+# GPU temperature threshold to activate fan 2 (Celsius)
+# Fan 2 is the GPU fan — it should react to GPU heat too
+GPU_TEMP_THRESHOLD=65
+
+# Hysteresis: fan turns OFF only when temp drops this many degrees below threshold
+# Prevents oscillation when temperature hovers near the threshold
+TEMP_HYSTERESIS=10
+
+# Base poll interval in seconds (adaptive polling reduces this near threshold)
+POLL_INTERVAL=20
+
+# Trend activation: activate fan proactively if temp rises faster than N °C/sample
+# Set to 0 to disable trend detection
+TREND_RATE=4
 ```
 
 Apply changes: `sudo systemctl restart asus-fan2`
+
+### How the intelligent daemon works
+
+The daemon runs continuously and makes decisions every polling cycle:
+
+1. **Dual temperature input**: reads both CPU (via coretemp hwmon) and GPU (via `nvidia-smi`) temperatures
+2. **Hysteresis**: activates at `TEMP_THRESHOLD`, deactivates only when temp drops below `TEMP_THRESHOLD - TEMP_HYSTERESIS` — eliminates fan chattering
+3. **Trend detection**: if temperature is rising faster than `TREND_RATE` °C per sample, activates fan proactively before hitting the threshold
+4. **Adaptive polling**: checks every 5s when near threshold or fan is running, slows to `POLL_INTERVAL` when temperatures are low
+5. **Verified startup**: confirms via `ST83` that fan 2 actually started spinning after the on command
 
 ## Verifying Your Hardware
 

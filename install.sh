@@ -23,20 +23,29 @@ sudo tee /etc/asus-fan2/config > /dev/null << 'CONFIG'
 # Enable fan 2 when on AC power
 ENABLE_ON_AC=true
 
-# Enable fan 2 when on battery
+# Enable fan 2 when on battery (false = save power)
 ENABLE_ON_BATTERY=false
 
-# Temperature threshold to activate fan 2 (Celsius)
-TEMP_THRESHOLD=55
+# CPU temperature threshold to activate fan 2 (Celsius)
+TEMP_THRESHOLD=75
 
-# Poll interval in seconds
-POLL_INTERVAL=10
+# GPU temperature threshold to activate fan 2 (Celsius)
+# Fan 2 is the GPU fan — it reacts to GPU temp too
+GPU_TEMP_THRESHOLD=65
+
+# Hysteresis: fan 2 turns OFF only when temp drops this many degrees below threshold
+# Prevents oscillation when temperature bounces around the threshold
+TEMP_HYSTERESIS=10
+
+# Poll interval in seconds (base — adaptive polling reduces this when temp is near threshold)
+POLL_INTERVAL=20
+
+# Trend activation: if temperature is rising faster than this many °C per sample,
+# activate fan 2 proactively before hitting the threshold (0 = disabled)
+TREND_RATE=4
 
 # Hwmon paths (leave empty for auto-detection)
-# Fan 1 RPM sensor — auto-detects hwmon named "asus" with fan1_input
 FAN1_HWMON=""
-
-# CPU temperature sensor — auto-detects hwmon named "coretemp"
 CPU_TEMP_HWMON=""
 CONFIG
 
@@ -45,11 +54,11 @@ echo "[3/5] Installing control script..."
 sudo tee /usr/local/bin/asus-fan2-ctrl > /dev/null << 'SCRIPT'
 #!/bin/bash
 # ASUS UX510 Fan 2 Controller
-# Controls the second (GPU) fan via ACPI WRAM 0xF922 (bit 0x40 toggle)
+# Controls the second (GPU) fan via ACPI WRAM 0xF922 (bit 0x40)
+# Reacts to both CPU and GPU temperatures with hysteresis and adaptive polling.
 #
-# SAFETY: This script ONLY writes to register 0xF922 (bit 0x40).
-#         It NEVER touches fan 1 registers (0xF921, 0x97, 0xA0, 0xA6).
-#         It NEVER uses ec_probe or ST84.
+# SAFETY: Only writes to register 0xF922 (bit 0x40).
+#         Never touches fan 1 registers (0xF921, 0x97, 0xA0, 0xA6).
 
 CONFIG_FILE="/etc/asus-fan2/config"
 ACPI_CALL="/proc/acpi/call"
@@ -58,8 +67,11 @@ LOG_TAG="asus-fan2"
 # Defaults (overridden by config)
 ENABLE_ON_AC=true
 ENABLE_ON_BATTERY=false
-POLL_INTERVAL=10
-TEMP_THRESHOLD=55
+POLL_INTERVAL=20
+TEMP_THRESHOLD=75
+GPU_TEMP_THRESHOLD=65
+TEMP_HYSTERESIS=10
+TREND_RATE=4
 FAN1_HWMON=""
 CPU_TEMP_HWMON=""
 
@@ -69,19 +81,19 @@ CPU_TEMP_HWMON=""
 
 log() {
     logger -t "$LOG_TAG" "$1"
-    echo "$(date): $1"
+    echo "$(date '+%H:%M:%S'): $1"
 }
 
 log_err() {
     logger -t "$LOG_TAG" -p user.err "$1"
-    echo "$(date): ERROR: $1" >&2
+    echo "$(date '+%H:%M:%S'): ERROR: $1" >&2
 }
 
 # ── ACPI interface ───────────────────────────────────────────────────────
 
 acpi_call() {
     echo "$1" > "$ACPI_CALL"
-    cat "$ACPI_CALL" 2>/dev/null | tr -d '\0'
+    tr -d '\0' < "$ACPI_CALL" 2>/dev/null
 }
 
 # ── Hardware detection ───────────────────────────────────────────────────
@@ -89,47 +101,33 @@ acpi_call() {
 find_hwmon() {
     local target_name="$1"
     for h in /sys/class/hwmon/hwmon*; do
-        if [ "$(cat "$h/name" 2>/dev/null)" = "$target_name" ]; then
-            echo "$h"
-            return 0
-        fi
+        [ "$(cat "$h/name" 2>/dev/null)" = "$target_name" ] && echo "$h" && return 0
     done
     return 1
 }
 
 detect_hwmon_paths() {
-    # Fan 1: look for hwmon named "asus" with fan1_input
     if [ -z "$FAN1_HWMON" ] || [ ! -f "$FAN1_HWMON" ]; then
         local asus_hwmon
         asus_hwmon=$(find_hwmon "asus") || true
         if [ -n "$asus_hwmon" ] && [ -f "$asus_hwmon/fan1_input" ]; then
             FAN1_HWMON="$asus_hwmon/fan1_input"
-            log "Detected fan 1 hwmon: $FAN1_HWMON"
-        elif [ -n "$FAN1_HWMON" ] && [ -f "$FAN1_HWMON" ]; then
-            log "Using config fan 1 hwmon: $FAN1_HWMON"
+            log "Detected fan1 hwmon: $FAN1_HWMON"
         else
-            log "WARNING: fan 1 hwmon not found — fan 1 safety monitoring disabled"
             FAN1_HWMON=""
         fi
-    else
-        log "Using config fan 1 hwmon: $FAN1_HWMON"
     fi
 
-    # CPU temp: look for hwmon named "coretemp"
     if [ -z "$CPU_TEMP_HWMON" ] || [ ! -f "$CPU_TEMP_HWMON" ]; then
         local coretemp_hwmon
         coretemp_hwmon=$(find_hwmon "coretemp") || true
         if [ -n "$coretemp_hwmon" ] && [ -f "$coretemp_hwmon/temp1_input" ]; then
             CPU_TEMP_HWMON="$coretemp_hwmon/temp1_input"
             log "Detected CPU temp hwmon: $CPU_TEMP_HWMON"
-        elif [ -n "$CPU_TEMP_HWMON" ] && [ -f "$CPU_TEMP_HWMON" ]; then
-            log "Using config CPU temp hwmon: $CPU_TEMP_HWMON"
         else
             log_err "CPU temp hwmon not found — cannot operate safely"
             exit 1
         fi
-    else
-        log "Using config CPU temp hwmon: $CPU_TEMP_HWMON"
     fi
 }
 
@@ -147,19 +145,30 @@ get_cpu_temp() {
     echo $((t / 1000))
 }
 
+# Returns GPU temp in °C, or -1 if unavailable
+get_gpu_temp() {
+    if command -v nvidia-smi &>/dev/null; then
+        local t
+        t=$(nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null | tr -d ' ')
+        if [[ "$t" =~ ^[0-9]+$ ]]; then
+            echo "$t"
+            return 0
+        fi
+    fi
+    echo "-1"
+}
+
 get_fan1_rpm() {
     if [ -n "$FAN1_HWMON" ] && [ -f "$FAN1_HWMON" ]; then
         cat "$FAN1_HWMON" 2>/dev/null || echo "0"
     else
-        echo "-1"  # unknown
+        echo "-1"
     fi
 }
 
 # ── Fan 2 control (ONLY register 0xF922, bit 0x40) ──────────────────────
 
 fan2_present() {
-    # Test if fan 2 actually responds via ST83 (more reliable than RRAM 0xF920 flag,
-    # which returns 0x89 on UX510UWK — bit 0x02 not set despite fan 2 working)
     local val
     val=$(acpi_call '\_SB.PCI0.LPCB.EC0.ST83 1')
     [ -n "$val" ] && [ "$val" != "Error" ]
@@ -172,7 +181,7 @@ fan2_read_reg() {
 fan2_on() {
     local cur
     cur=$(fan2_read_reg | sed 's/^0x//')
-    cur=$((16#${cur}))
+    cur=$((16#${cur:-0}))
     local nv=$(( cur | 0x40 ))
     acpi_call "\_SB.PCI0.LPCB.EC0.WRAM 0xF922 $nv" > /dev/null
     log "Fan 2 ON (reg=0x$(printf '%02x' $nv))"
@@ -181,7 +190,7 @@ fan2_on() {
 fan2_off() {
     local cur
     cur=$(fan2_read_reg | sed 's/^0x//')
-    cur=$((16#${cur}))
+    cur=$((16#${cur:-0}))
     local nv=$(( cur & ~0x40 ))
     acpi_call "\_SB.PCI0.LPCB.EC0.WRAM 0xF922 $nv" > /dev/null
     log "Fan 2 OFF (reg=0x$(printf '%02x' $nv))"
@@ -190,66 +199,99 @@ fan2_off() {
 fan2_is_on() {
     local cur
     cur=$(fan2_read_reg | sed 's/^0x//')
-    cur=$((16#${cur}))
+    cur=$((16#${cur:-0}))
     [ $(( cur & 0x40 )) -ne 0 ]
+}
+
+# Turns fan 2 on and verifies it actually started via ST83
+fan2_on_verified() {
+    fan2_on
+    sleep 2
+    local st
+    st=$(acpi_call '\_SB.PCI0.LPCB.EC0.ST83 1')
+    if [ "$st" = "0x0" ] || [ "$st" = "0" ]; then
+        log "Fan 2 did not respond after on command, retrying..."
+        fan2_on
+    fi
 }
 
 # ── Startup checks ──────────────────────────────────────────────────────
 
 preflight_checks() {
-    # 1. acpi_call loaded?
     if [ ! -f "$ACPI_CALL" ]; then
         log_err "$ACPI_CALL not found — is acpi_call module loaded?"
         exit 1
     fi
 
-    # 2. Fan 2 physically present?
     if ! fan2_present; then
         log_err "Fan 2 not detected (ST83 1 returned no valid response)"
         exit 1
     fi
-    log "Fan 2 presence confirmed"
+    log "Fan 2 presence confirmed (ST83=$(acpi_call '\_SB.PCI0.LPCB.EC0.ST83 1'))"
 
-    # 3. Log initial register value
     local init_val
     init_val=$(fan2_read_reg)
     log "Initial 0xF922 value: $init_val"
 
-    # 4. Detect hwmon paths
     detect_hwmon_paths
 
-    # 5. Log fan 1 status (info only, no safety check)
     local fan1_rpm
     fan1_rpm=$(get_fan1_rpm)
-    if [ "$fan1_rpm" != "-1" ]; then
-        log "Fan 1 RPM at startup: $fan1_rpm"
-    fi
-}
+    [ "$fan1_rpm" != "-1" ] && log "Fan 1 RPM at startup: $fan1_rpm"
 
-# ── Fan 1 safety monitor ────────────────────────────────────────────────
-
-check_fan1_safety() {
-    return 0
+    local gpu_t
+    gpu_t=$(get_gpu_temp)
+    [ "$gpu_t" != "-1" ] && log "GPU temp at startup: ${gpu_t}°C"
 }
 
 # ── Status display ───────────────────────────────────────────────────────
 
 fan2_status() {
-    # Detect paths for status display
     detect_hwmon_paths 2>/dev/null
 
-    echo "=== ASUS UX510 Fan 2 Status ==="
-    echo "AC Power       : $(is_on_ac && echo yes || echo no)"
-    echo "CPU Temp       : $(get_cpu_temp)C"
-    local fan1_rpm
+    local cpu_t gpu_t fan1_rpm ac
+    cpu_t=$(get_cpu_temp)
+    gpu_t=$(get_gpu_temp)
     fan1_rpm=$(get_fan1_rpm)
-    if [ "$fan1_rpm" != "-1" ]; then
-        echo "Fan 1 RPM      : $fan1_rpm"
-    fi
-    echo "Fan 2          : $(fan2_is_on && echo ON || echo OFF)"
+    ac=$(is_on_ac && echo "yes" || echo "no")
+
+    echo "=== ASUS UX510 Fan 2 Status ==="
+    echo "AC Power       : $ac"
+    echo "CPU Temp       : ${cpu_t}°C  (threshold: ${TEMP_THRESHOLD}°C, hysteresis: ${TEMP_HYSTERESIS}°C)"
+    [ "$gpu_t" != "-1" ] && echo "GPU Temp       : ${gpu_t}°C  (threshold: ${GPU_TEMP_THRESHOLD}°C)"
+    [ "$fan1_rpm" != "-1" ] && echo "Fan 1 RPM      : $fan1_rpm"
+    echo "Fan 2 state    : $(fan2_is_on && echo "ON" || echo "OFF")"
     echo "Fan 2 ST83     : $(acpi_call '\_SB.PCI0.LPCB.EC0.ST83 1')"
     echo "Fan 2 Reg F922 : $(fan2_read_reg)"
-    echo "Config         : AC=$ENABLE_ON_AC  Battery=$ENABLE_ON_BATTERY  Threshold=${TEMP_THRESHOLD}C"
+    echo "Config         : AC=$ENABLE_ON_AC  Battery=$ENABLE_ON_BATTERY"
+    echo "                 CPU_thresh=${TEMP_THRESHOLD}°C  GPU_thresh=${GPU_TEMP_THRESHOLD}°C  hysteresis=${TEMP_HYSTERESIS}°C"
+}
+
+# ── Adaptive poll interval ────────────────────────────────────────────────
+
+# Returns poll delay in seconds based on proximity to threshold
+adaptive_poll() {
+    local cpu_t="$1" gpu_t="$2" fan_state="$3"
+    local cpu_dist gpu_dist min_dist
+
+    cpu_dist=$(( TEMP_THRESHOLD - cpu_t ))
+    [ $cpu_dist -lt 0 ] && cpu_dist=0
+
+    if [ "$gpu_t" != "-1" ]; then
+        gpu_dist=$(( GPU_TEMP_THRESHOLD - gpu_t ))
+        [ $gpu_dist -lt 0 ] && gpu_dist=0
+        min_dist=$(( cpu_dist < gpu_dist ? cpu_dist : gpu_dist ))
+    else
+        min_dist=$cpu_dist
+    fi
+
+    if [ $min_dist -le 5 ] || [ "$fan_state" = "on" ]; then
+        echo 5      # near threshold or running: check fast
+    elif [ $min_dist -le 15 ]; then
+        echo 10     # warming up
+    else
+        echo "$POLL_INTERVAL"  # cold: use configured interval
+    fi
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────
@@ -258,33 +300,72 @@ case "${1:-daemon}" in
     on)      fan2_on ;;
     off)     fan2_off ;;
     status)  fan2_status ;;
+
     daemon)
-        log "Starting (AC=$ENABLE_ON_AC Battery=$ENABLE_ON_BATTERY threshold=${TEMP_THRESHOLD}C interval=${POLL_INTERVAL}s)"
+        log "Starting daemon (AC=$ENABLE_ON_AC Battery=$ENABLE_ON_BATTERY cpu_thresh=${TEMP_THRESHOLD}°C gpu_thresh=${GPU_TEMP_THRESHOLD}°C hyst=${TEMP_HYSTERESIS}°C interval=${POLL_INTERVAL}s trend_rate=${TREND_RATE}°C/sample)"
         modprobe acpi_call 2>/dev/null
 
         preflight_checks
 
-        # Clean shutdown: clear bit 0x40 only, do not touch anything else
         trap 'fan2_off; log "Stopped (clean shutdown)"; exit 0' SIGTERM SIGINT
 
         STATE="off"
-        while true; do
-            # Fan 1 safety check every iteration
-            check_fan1_safety
+        PREV_CPU=0
+        PREV_GPU=-1
 
+        while true; do
             RUN=false
             if is_on_ac && [ "$ENABLE_ON_AC" = true ]; then RUN=true
             elif ! is_on_ac && [ "$ENABLE_ON_BATTERY" = true ]; then RUN=true; fi
 
-            TEMP=$(get_cpu_temp)
+            CPU_TEMP=$(get_cpu_temp)
+            GPU_TEMP=$(get_gpu_temp)
 
-            if [ "$RUN" = true ] && [ "$TEMP" -ge "$TEMP_THRESHOLD" ]; then
-                [ "$STATE" = "off" ] && { fan2_on; STATE="on"; }
-            else
-                [ "$STATE" = "on" ] && { fan2_off; STATE="off"; }
+            # Hysteresis thresholds
+            OFF_CPU=$(( TEMP_THRESHOLD - TEMP_HYSTERESIS ))
+            OFF_GPU=$(( GPU_TEMP_THRESHOLD - TEMP_HYSTERESIS ))
+
+            # Trend detection: rate of rise since last sample
+            CPU_TREND=$(( CPU_TEMP - PREV_CPU ))
+            TREND_ACTIVE=false
+            if [ "$TREND_RATE" -gt 0 ] && [ $CPU_TREND -ge "$TREND_RATE" ]; then
+                TREND_ACTIVE=true
             fi
-            sleep "$POLL_INTERVAL"
+            if [ "$GPU_TEMP" != "-1" ] && [ "$PREV_GPU" != "-1" ]; then
+                GPU_TREND=$(( GPU_TEMP - PREV_GPU ))
+                if [ "$TREND_RATE" -gt 0 ] && [ $GPU_TREND -ge "$TREND_RATE" ]; then
+                    TREND_ACTIVE=true
+                fi
+            fi
+
+            # Decision: activate if above threshold, or rising fast, or already on and above hysteresis floor
+            SHOULD_ON=false
+            if [ "$RUN" = true ]; then
+                if [ "$CPU_TEMP" -ge "$TEMP_THRESHOLD" ]; then SHOULD_ON=true; fi
+                if [ "$GPU_TEMP" != "-1" ] && [ "$GPU_TEMP" -ge "$GPU_TEMP_THRESHOLD" ]; then SHOULD_ON=true; fi
+                if [ "$TREND_ACTIVE" = true ]; then SHOULD_ON=true; fi
+                # Keep fan on if still above hysteresis floor (prevent premature off)
+                if [ "$STATE" = "on" ]; then
+                    if [ "$CPU_TEMP" -ge "$OFF_CPU" ]; then SHOULD_ON=true; fi
+                    if [ "$GPU_TEMP" != "-1" ] && [ "$GPU_TEMP" -ge "$OFF_GPU" ]; then SHOULD_ON=true; fi
+                fi
+            fi
+
+            if [ "$SHOULD_ON" = true ] && [ "$STATE" = "off" ]; then
+                fan2_on_verified
+                STATE="on"
+            elif [ "$SHOULD_ON" = false ] && [ "$STATE" = "on" ]; then
+                fan2_off
+                STATE="off"
+            fi
+
+            PREV_CPU=$CPU_TEMP
+            PREV_GPU=$GPU_TEMP
+
+            DELAY=$(adaptive_poll "$CPU_TEMP" "$GPU_TEMP" "$STATE")
+            sleep "$DELAY"
         done ;;
+
     *)
         echo "Usage: $0 {on|off|status|daemon}"
         exit 1 ;;
@@ -306,9 +387,8 @@ ExecStartPre=/sbin/modprobe acpi_call
 ExecStart=/usr/local/bin/asus-fan2-ctrl daemon
 ExecStop=/usr/local/bin/asus-fan2-ctrl off
 Restart=on-failure
-RestartSec=10
-StartLimitBurst=3
-StartLimitIntervalSec=60
+RestartSec=10s
+TimeoutStopSec=15
 
 [Install]
 WantedBy=multi-user.target
@@ -318,7 +398,7 @@ SERVICE
 echo "[5/5] Enabling and starting service..."
 sudo systemctl daemon-reload
 sudo systemctl enable asus-fan2
-sudo systemctl start asus-fan2
+sudo systemctl restart asus-fan2
 
 echo ""
 echo "=== Installation complete! ==="
